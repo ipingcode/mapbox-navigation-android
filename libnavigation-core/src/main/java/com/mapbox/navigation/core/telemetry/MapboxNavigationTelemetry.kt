@@ -182,15 +182,15 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
 
 // **********  EVENT OBSERVERS ***************
 
+    //TODO do we need it? maybe just observe route from TelemetryLocationAndProgressDispatcher
     private fun populateOriginalRouteConditionally() {
-        ifNonNull(weakMapboxNavigation.get()) { mapboxNavigation ->
-            val routes = mapboxNavigation.getRoutes()
-            if (routes.isNotEmpty()) {
-                Log.d(TAG, "Getting last route from MapboxNavigation")
-                callbackDispatcher.clearOriginalRoute()
-                callbackDispatcher.getOriginalRouteReference().set(routes[0])
-            }
-        }
+//        ifNonNull(weakMapboxNavigation.get()) { mapboxNavigation ->
+//            val routes = mapboxNavigation.getRoutes()
+//            if (routes.isNotEmpty()) {
+//                Log.d(TAG, "Getting last route from MapboxNavigation")
+//                callbackDispatcher.setOriginalRoute(routes[0])
+//            }
+//        }
     }
 
     private fun sessionStart() {
@@ -256,37 +256,39 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
                 (Time.SystemImpl.millis() - dynamicValues.timeOfRerouteEvent.get()).toInt()
             )
             callbackDispatcher.addLocationEventDescriptor(
-                ItemAccumulationEventDescriptor(
-                    ArrayDeque(callbackDispatcher.getCopyOfCurrentLocationBuffer()),
+                EventBuffers(
+                    ArrayDeque(callbackDispatcher.copyLocationBuffer()),
                     ArrayDeque()
                 ) { preEventBuffer, postEventBuffer ->
-                    // Populate the RerouteEvent
-                    val rerouteEvent = RerouteEvent(populateSessionState()).apply {
-                        newDistanceRemaining = newRoute.distance()?.toInt() ?: -1
-                        newDurationRemaining = newRoute.duration()?.toInt() ?: -1
-                        newRouteGeometry = obtainGeometry(newRoute)
-                    }
-
-                    // Populate and then send a NavigationRerouteEvent
-                    val metricsRouteProgress = MetricsRouteProgress(routeProgress)
-                    val navigationRerouteEvent = NavigationRerouteEvent(
-                        PhoneState(context),
-                        rerouteEvent,
-                        metricsRouteProgress
-                    ).apply {
-                        locationsBefore = preEventBuffer.toTelemetryLocations().toTypedArray()
-                        locationsAfter = postEventBuffer.toTelemetryLocations().toTypedArray()
-
-                        dynamicValues.let {
-                            secondsSinceLastReroute = it.timeSinceLastReroute.get() / ONE_SECOND
-                            distanceRemaining = it.distanceRemaining.get().toInt()
-                            distanceCompleted = it.distanceCompleted.get().toInt()
-                            durationRemaining = it.durationRemaining.get()
+                    telemetryThreadControl.scope.launch {
+                        // Populate the RerouteEvent
+                        val rerouteEvent = RerouteEvent(populateSessionState()).apply {
+                            newDistanceRemaining = newRoute.distance()?.toInt() ?: -1
+                            newDurationRemaining = newRoute.duration()?.toInt() ?: -1
+                            newRouteGeometry = obtainGeometry(newRoute)
                         }
 
+                        // Populate and then send a NavigationRerouteEvent
+                        val metricsRouteProgress = MetricsRouteProgress(routeProgress)
+                        val navigationRerouteEvent = NavigationRerouteEvent(
+                            PhoneState(context),
+                            rerouteEvent,
+                            metricsRouteProgress
+                        ).apply {
+                            locationsBefore = preEventBuffer.toTelemetryLocations().toTypedArray()
+                            locationsAfter = postEventBuffer.toTelemetryLocations().toTypedArray()
+
+                            dynamicValues.let {
+                                secondsSinceLastReroute = it.timeSinceLastReroute.get() / ONE_SECOND
+                                distanceRemaining = it.distanceRemaining.get().toInt()
+                                distanceCompleted = it.distanceCompleted.get().toInt()
+                                durationRemaining = it.durationRemaining.get()
+                            }
+
+                        }
+                        populateNavigationEvent(navigationRerouteEvent)
+                        telemetryEventGate(navigationRerouteEvent)
                     }
-                    populateNavigationEvent(navigationRerouteEvent)
-                    telemetryEventGate(navigationRerouteEvent)
                 }
             )
         }
@@ -378,15 +380,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
     private fun monitorOffRouteEvents() {
         telemetryThreadControl.scope.monitorChannelWithException(
             callbackDispatcher.getOffRouteEventChannel(),
-            { offRoute ->
-                when (offRoute) {
-                    true -> {
-                        handleOffRouteEvent()
-                    }
-                    false -> {
-                    }
-                }
-            }
+            { offRoute -> if (offRoute) handleOffRouteEvent() }
         )
     }
 
@@ -395,7 +389,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
             select {
                 telemetryThreadControl.job.onJoin {
                     Log.d(TAG, "master job canceled")
-                    callbackDispatcher.flushBuffers()
+                    callbackDispatcher.flushLocationEventBuffer()
                     MapboxMetricsReporter.disable() // Disable telemetry unconditionally
                 }
             }
@@ -440,8 +434,8 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         Log.d(TAG, "trying to post a user feedback event")
         val lastProgress = callbackDispatcher.routeProgress
         callbackDispatcher.addLocationEventDescriptor(
-            ItemAccumulationEventDescriptor(
-                ArrayDeque(callbackDispatcher.getCopyOfCurrentLocationBuffer()),
+            EventBuffers(
+                ArrayDeque(callbackDispatcher.copyLocationBuffer()),
                 ArrayDeque()
             ) { preEventBuffer, postEventBuffer ->
                 val feedbackEvent = NavigationFeedbackEvent(
@@ -457,8 +451,10 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
                     this.feedbackSubType = feedbackSubType
                     this.appMetadata = appMetadata
                 }
-                populateNavigationEvent(feedbackEvent)
-                telemetryEventGate(feedbackEvent)
+                telemetryThreadControl.scope.launch {
+                    populateNavigationEvent(feedbackEvent)
+                    telemetryEventGate(feedbackEvent)
+                }
             }
         )
     }
@@ -497,7 +493,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         }
         populateNavigationEvent(cancelEvent)
         telemetryEventGate(cancelEvent)
-        callbackDispatcher.cancelCollectionAndPostFinalEvents()
+        callbackDispatcher.clearLocationEventBuffer()
     }
 
     /**
@@ -515,7 +511,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
     private fun handleSessionStart() {
         telemetryThreadControl.scope.launch {
             Log.d(TAG, "Waiting in handleSessionStart")
-            dynamicValues.originalRoute.set(callbackDispatcher.getOriginalRouteAsync().await())
+            dynamicValues.originalRoute.set(callbackDispatcher.originalRouteDeffered.await())
             dynamicValues.originalRoute.get()?.let { directionsRoute ->
                 Log.d(TAG, "The wait is over")
                 sessionStartHelper(directionsRoute)
@@ -553,7 +549,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         monitorSession = telemetryThreadControl.scope.launch {
             val event = telemetryDeparture(
                 directionsRoute,
-                callbackDispatcher.getFirstLocationAsync().await()
+                callbackDispatcher.firstLocationDeffered.await()
             )
             telemetryEventGate(event)
             monitorSession()
@@ -574,7 +570,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         dynamicValues.routeArrived.set(true)
         populateNavigationEvent(arriveEvent)
         telemetryEventGate(arriveEvent)
-        callbackDispatcher.cancelCollectionAndPostFinalEvents()
+        callbackDispatcher.clearLocationEventBuffer()
         populateOriginalRouteConditionally()
     }
 
@@ -630,7 +626,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         }
     }
 
-    private fun telemetryDeparture(
+    private suspend fun telemetryDeparture(
         directionsRoute: DirectionsRoute,
         startingLocation: Location
     ): MetricEvent {
@@ -658,7 +654,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         weakMapboxNavigation.clear()
     }
 
-    private fun populateSessionState(newLocation: Location? = null): SessionState {
+    private suspend fun populateSessionState(newLocation: Location? = null): SessionState {
         val timeSinceReroute: Int = if (dynamicValues.timeSinceLastReroute.get() == 0) {
             -1
         } else
@@ -672,13 +668,13 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
             eventDate = Date()
             eventRouteDistanceCompleted =
                 callbackDispatcher.routeProgress?.distanceTraveled?.toDouble() ?: 0.0
-            originalDirectionRoute = callbackDispatcher.getOriginalRoute()
+            originalDirectionRoute = callbackDispatcher.originalRouteDeffered.await()
             currentDirectionRoute =
                 callbackDispatcher.routeProgress?.route
             sessionIdentifier = dynamicValues.sessionId
             tripIdentifier = dynamicValues.tripIdentifier.get()
             originalRequestIdentifier =
-                callbackDispatcher.getOriginalRoute()?.routeOptions()?.requestUuid()
+                callbackDispatcher.originalRouteDeffered.await().routeOptions()?.requestUuid()
             requestIdentifier =
                 callbackDispatcher.routeProgress?.route?.routeOptions()?.requestUuid()
             mockLocation = locationEngineName == MOCK_PROVIDER
@@ -691,7 +687,7 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
         }
     }
 
-    private fun populateNavigationEvent(
+    private suspend fun populateNavigationEvent(
         navigationEvent: NavigationEvent,
         route: DirectionsRoute? = null,
         newLocation: Location? = null
@@ -715,12 +711,12 @@ internal object MapboxNavigationTelemetry : MapboxNavigationTelemetryInterface {
                 }
             }
 
-            callbackDispatcher.getOriginalRoute().let { originalRoute ->
-                originalStepCount = obtainStepCount(originalRoute)
-                originalEstimatedDistance = originalRoute?.distance()?.toInt() ?: 0
-                originalEstimatedDuration = originalRoute?.duration()?.toInt() ?: 0
-                originalRequestIdentifier = originalRoute?.routeOptions()?.requestUuid()
-                originalGeometry = originalRoute?.geometry()
+            callbackDispatcher.originalRouteDeffered.await().let {
+                originalStepCount = obtainStepCount(it)
+                originalEstimatedDistance = it.distance()?.toInt() ?: 0
+                originalEstimatedDuration = it.duration()?.toInt() ?: 0
+                originalRequestIdentifier = it.routeOptions()?.requestUuid()
+                originalGeometry = it.geometry()
             }
 
             locationEngine = locationEngineNameExternal
