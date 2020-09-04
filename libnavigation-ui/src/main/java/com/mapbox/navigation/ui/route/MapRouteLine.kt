@@ -34,6 +34,7 @@ import com.mapbox.navigation.ui.internal.route.RouteConstants.POINT_DISTANCE_CAL
 import com.mapbox.navigation.ui.internal.route.RouteConstants.PRIMARY_ROUTE_LAYER_ID
 import com.mapbox.navigation.ui.internal.route.RouteConstants.PRIMARY_ROUTE_TRAFFIC_LAYER_ID
 import com.mapbox.navigation.ui.internal.route.RouteConstants.PRIMARY_ROUTE_TRAFFIC_SOURCE_ID
+import com.mapbox.navigation.ui.internal.route.RouteConstants.ROUTE_LINE_DISTANCE_TRAVELED_DELTA_THRESHOLD
 import com.mapbox.navigation.ui.internal.route.RouteConstants.ROUTE_LINE_UPDATE_MAX_DISTANCE_THRESHOLD_IN_METERS
 import com.mapbox.navigation.ui.internal.route.RouteConstants.SEVERE_CONGESTION_VALUE
 import com.mapbox.navigation.ui.internal.route.RouteConstants.UNKNOWN_CONGESTION_VALUE
@@ -58,7 +59,9 @@ import com.mapbox.navigation.utils.internal.parallelMap
 import com.mapbox.turf.TurfConstants
 import com.mapbox.turf.TurfMeasurement
 import com.mapbox.turf.TurfMisc
+import timber.log.Timber
 import java.math.BigDecimal
+import kotlin.math.abs
 
 /**
  * Responsible for the appearance of the route lines on the map. This class applies styling
@@ -143,6 +146,8 @@ internal class MapRouteLine(
     private var primaryRoute: DirectionsRoute? = null
     var vanishPointOffset: Float = 0f
         private set
+    private val routeDistanceTraveledCache = LruCache<DirectionsRoute, Float>(1)
+    private var vanishingPointUpdateInhibited: Boolean = false
 
     private val routeLineTraveledColor: Int by lazy {
         getStyledColor(
@@ -411,6 +416,16 @@ internal class MapRouteLine(
         routeLineInitializedCallback?.onInitialized(
             RouteLineLayerIds(PRIMARY_ROUTE_TRAFFIC_LAYER_ID, PRIMARY_ROUTE_LAYER_ID, listOf(ALTERNATIVE_ROUTE_LAYER_ID))
         )
+    }
+
+    fun updateDistanceTraveledCache(route: DirectionsRoute, percentDistanceTraveled: Float) {
+        synchronized(routeDistanceTraveledCache) {
+            routeDistanceTraveledCache.put(route, percentDistanceTraveled)
+        }
+    }
+
+    fun inhibitVanishingPointUpdate(inhibitVanishingPointUpdate: Boolean) {
+        vanishingPointUpdateInhibited = inhibitVanishingPointUpdate
     }
 
     /**
@@ -929,17 +944,30 @@ internal class MapRouteLine(
                 TurfConstants.UNIT_METERS
             ).getProperty("dist").asDouble
 
-            if (nearestPointOnLineDistance > ROUTE_LINE_UPDATE_MAX_DISTANCE_THRESHOLD_IN_METERS) {
+            if (
+                nearestPointOnLineDistance > ROUTE_LINE_UPDATE_MAX_DISTANCE_THRESHOLD_IN_METERS ||
+                vanishingPointUpdateInhibited
+            ) {
                 return
             }
 
+            val percentDistanceTraveledFromCache: Float = routeDistanceTraveledCache[primaryRoute] ?: 0f
             val distanceTraveled = MapRouteLineSupport.findDistanceOfPointAlongLine(lineString, point)
             val percentTraveled = (distanceTraveled / routeDistance).toFloat()
-            if (percentTraveled > MINIMUM_ROUTE_LINE_OFFSET) {
+            val distanceTraveledDelta = abs(percentDistanceTraveledFromCache - percentTraveled)
+
+            Timber.e("*** dist traveled ${percentTraveled.toBigDecimal()} from cache ${percentDistanceTraveledFromCache.toBigDecimal()} delta ${distanceTraveledDelta.toBigDecimal()} vanish inhibited $vanishingPointUpdateInhibited")
+
+            if (
+                percentTraveled > MINIMUM_ROUTE_LINE_OFFSET &&
+                distanceTraveledDelta < ROUTE_LINE_DISTANCE_TRAVELED_DELTA_THRESHOLD
+            ) {
                 val expression = getExpressionAtOffset(percentTraveled)
                 hideCasingLineAtOffset(percentTraveled)
                 hideRouteLineAtOffset(percentTraveled)
                 decorateRouteLine(expression)
+            } else {
+                Timber.e("*** not updating vanishing point")
             }
         }
     }
